@@ -291,7 +291,7 @@ def guar_ok(guar_req, has_guar):
 # ==============================================================================
 # 6. CHOOSE SRFs PER CASE (works on the small per-SRF summary, not full data)
 # ==============================================================================
-def choose_srfs(dec, srf_info, ordered_srfs, case):
+def choose_srfs(dec, srf_info, ordered_srfs, case, globally_used=None):
     """
     Return a list of tuples: (srf, source_label, trigger_relationship)
     describing up to SRF_PER_CASE chosen SRFs for this case.
@@ -305,12 +305,15 @@ def choose_srfs(dec, srf_info, ordered_srfs, case):
 
     chosen = []
     used = set()
+    gused = globally_used if globally_used is not None else set()  # cross-case
 
     # Missing-value cases: any structurally/guarantee-eligible SRF works
     if rel in ("missing_brr", "missing_gbrr"):
         for srf in ordered_srfs:
             if len(chosen) >= cfg.SRF_PER_CASE:
                 break
+            if srf in gused:
+                continue
             info = srf_info.loc[srf]
             if guar_ok(guar_req, info["has_guar"]):
                 chosen.append((srf, "MISSING", None))
@@ -320,6 +323,8 @@ def choose_srfs(dec, srf_info, ordered_srfs, case):
     for srf in ordered_srfs:
         if len(chosen) >= cfg.SRF_PER_CASE:
             break
+        if srf in gused:
+            continue
         info = srf_info.loc[srf]
         if not secured_ok(secured_req, info["secured_class"], info["coll_count"]):
             continue
@@ -335,7 +340,7 @@ def choose_srfs(dec, srf_info, ordered_srfs, case):
         for srf in ordered_srfs:
             if len(chosen) >= cfg.SRF_PER_CASE:
                 break
-            if srf in used:
+            if srf in used or srf in gused:
                 continue
             info = srf_info.loc[srf]
             if not secured_ok(secured_req, info["secured_class"], info["coll_count"]):
@@ -349,7 +354,7 @@ def choose_srfs(dec, srf_info, ordered_srfs, case):
         for srf in ordered_srfs:
             if len(chosen) >= cfg.SRF_PER_CASE:
                 break
-            if srf in used:
+            if srf in used or srf in gused:
                 continue
             info = srf_info.loc[srf]
             if not secured_ok(secured_req, info["secured_class"], info["coll_count"]):
@@ -540,13 +545,16 @@ def main():
     # ---- choose SRFs for every case (tiny work on the summary) ----
     plan = {}
     wanted_all = set()
+    globally_used = set()
     for case in TEST_CASES:
-        chosen = choose_srfs(dec, srf_info, ordered_srfs, case)
+        chosen = choose_srfs(dec, srf_info, ordered_srfs, case, globally_used)
         plan[case[0]] = (case, chosen)
         for srf, _, _ in chosen:
             wanted_all.add(str(srf))
+            globally_used.add(srf)
         if len(chosen) < cfg.SRF_PER_CASE:
-            log.warning(f"  {case[0]}: only {len(chosen)} SRF(s) qualified")
+            log.warning(f"  {case[0]}: only {len(chosen)} SRF(s) qualified "
+                        f"(unique-SRF constraint may have limited choices)")
         else:
             log.info(f"  {case[0]}: chose {len(chosen)} SRF(s)")
 
