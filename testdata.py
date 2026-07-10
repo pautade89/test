@@ -1,40 +1,30 @@
 """
 ================================================================================
- LGD ENGINE — TESTCASE-WISE TEST DATA GENERATOR  (SRF-GROUP EDITION)
+ LGD ENGINE — TESTCASE-WISE TEST DATA GENERATOR  (VECTORIZED / 800k-ROW EDITION)
 ================================================================================
- Selection unit = SingleNameSRF GROUP (a whole exposure), not a single row.
+ Same selection logic as the SRF-group edition, re-engineered for ~800k rows:
 
- For each of the 16 batch test cases:
-   1. Group the consolidated sheet by SingleNameSRF.
-   2. Evaluate SRFs in ASCENDING SingleNameSRF order.
-   3. An SRF QUALIFIES when:
-        - securedness matches at the SRF level (collateral count across the
-          whole exposure), AND
-        - guarantee presence matches at the SRF level, AND
-        - at least ONE row in the SRF has the required BorrowerBRR-vs-GBRR
-          relationship (relationship judged per-row).
-   4. Take UP TO 2 qualifying SRFs per test case.
-   5. Output ALL rows of those SRFs, with ALL 97 original columns preserved,
-      plus a few audit columns.
+   * VECTORIZED securedness + guarantee + BRR/GBRR relationship (no per-row
+     Python loops over the full dataset — all done with pandas/numpy in C).
+   * TWO-PHASE read to save memory:
+       Phase 1  read ONLY the columns needed to DECIDE which SRFs qualify
+                (SRF, BRR, GBRR, CollateralID, GuaranteeID, GuarantorType,
+                 FacilityID), classify every SRF, and choose up to 2 SRFs/case.
+       Phase 2  read the FULL 97-column rows for ONLY the chosen SRFs
+                (~32 SRFs total), so the wide frame is tiny in memory.
+   * CSV-first (chunked scan supported); .xlsx also supported.
 
- BRR/GBRR handling
-   - Natural SRFs (a real row already satisfies the relationship) are preferred
-     and are copied UNCHANGED — the ideal, highest-fidelity test data.
-   - If fewer than 2 natural SRFs exist, the script falls back:
-       BORROW : on a structurally-correct SRF, adjust GBRR on the matching row(s)
-                to force the relationship (Option A — rating cell only).
-       FORCE  : as a last resort, write clean BRR/GBRR on one row of the SRF.
-     Any change is flagged per row and the original value preserved.
-
- Missing-value cases (14/15/16) null/blank BRR or GBRR on the SRF's rows.
-
- Output: one workbook, one sheet per test case + a _SUMMARY sheet.
+ Selection unit = SingleNameSRF group (whole exposure). For each of the 16
+ batch test cases, evaluate SRFs in ascending SingleNameSRF order; an SRF
+ qualifies when securedness (SRF level) + guarantee (SRF level) match AND at
+ least one row has the required BorrowerBRR-vs-GBRR relationship (row level).
+ Copy ALL rows of up to 2 qualifying SRFs, all original columns + audit columns.
 
  RUN:
-   python lgd_testdata_generator_srf.py \
-       --input cms_consolidated_report.xlsx \
+   python lgd_testdata_gen_fast.py \
+       --input cms_consolidated.csv \
        --output testcase_testdata.xlsx \
-       --srf-per-case 2
+       --srf-per-case 2 --order asc
 ================================================================================
 """
 
@@ -42,50 +32,83 @@ import argparse
 import logging
 import sys
 import re
+import os
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-log = logging.getLogger("lgd_testdata_srf")
+log = logging.getLogger("lgd_fast")
 
 
 # ==============================================================================
 # 1. CONFIG
 # ==============================================================================
 class Config:
-    # --- Grouping key: the whole-exposure identifier ---
-    COL_SRF = "SingleNameSRF"
+    COL_SRF          = "SingleNameSRF"
+    COL_BRR          = "BorrowerBRR"
+    COL_GBRR         = "GBRR"
+    COL_COLLATERAL   = "CollateralID"
+    COL_FACILITY     = "FacilityID"
+    COL_GUARANTEE_ID = "GuaranteeID"
+    COL_GUAR_TYPE    = "GuarantorType"
 
-    # --- Rating columns (confirmed from the query) ---
-    COL_BRR  = "BorrowerBRR"
-    COL_GBRR = "GBRR"
-
-    # --- Structural columns ---
-    COL_COLLATERAL    = "CollateralID"
-    COL_FACILITY      = "FacilityID"
-    COL_GUARANTEE_ID  = "GuaranteeID"
-    COL_GUAR_TYPE     = "GuarantorType"
-
-    # --- How many SRF groups to emit per test case ---
     SRF_PER_CASE = 2
+    INPUT_SHEET  = 0
 
-    # --- Borrowing approach: "A" = swap rating cell only (recommended) ---
-    BORROW_MODE = "A"
+    # Columns needed for the DECISION phase (Phase 1). Keep this minimal.
+    DECISION_COLS = [
+        COL_SRF, COL_BRR, COL_GBRR, COL_COLLATERAL,
+        COL_FACILITY, COL_GUARANTEE_ID, COL_GUAR_TYPE,
+    ]
 
-    # --- Input sheet (name or 0-based index) ---
-    INPUT_SHEET = 0
+    # CSV read options
+    CSV_ENCODING = None      # e.g. "utf-8-sig" or "cp1252" if needed
+    CSV_SEP      = ","       # e.g. ";" or "\t"
+    CSV_CHUNK    = 200_000   # rows per chunk in Phase 1 scan
 
-    # --- Securedness thresholds (collateral count across the SRF) ---
-    # 0 -> unsecured ; 1 -> partial single ; >=2 -> multiple (partial_multi/fully)
-    # (Proxy by count. Swap to value-vs-exposure if you supply those columns.)
+    # --- OUTPUT COLUMN FILTER --------------------------------------------------
+    # Only these original columns are written to the output (in this order),
+    # followed by the audit columns. Set OUTPUT_COLS = None to keep ALL columns.
+    # Names must match the consolidated sheet headers exactly. Any name not
+    # present in the file is skipped with a warning (so it's safe to list extras).
+    OUTPUT_COLS = [
+        # --- Single name / borrower ---
+        "SingleNameSRF",            # SRF (single name)
+        "BorrowerSRF",              # Borrower
+        "BorrowerBRR",              # BRR
+        "BorrowerSectorTypeCd",     # sector (drives loss-driver rules)
+        "BorrowerOSCAD",            # borrower outstanding (CAD)
+        "BorrowerAuthLimitCAD",     # borrower authorized amount (CAD)
+        "AuthorizedLimit",          # (cms) authorized limit, if present
+        # --- Facility ---
+        "FacilityID",               # facility id
+        "CADAdjAuthAmt",            # facility authorized (CAD adj auth amt)
+        "CADOSBalance",             # facility outstanding (CAD O/S balance)
+        "SeniorityCd",              # seniority
+        "FinalSegmentID",           # final segment id
+        "FinalLGDRate",             # final LGD rate
+        "FinalEAD",                 # EAD
+        "FinalUGD",                 # UGD
+        # --- Collateral ---
+        "CollateralID",             # collateral id
+        "AllocationValue",          # allocation value
+        "EligibleCollateralAmountCAD",  # eligible collateral amount
+        # --- Guarantee / guarantor ---
+        "GuarantorSRF",             # guarantor
+        "GuarantorType",            # guarantor type
+        "GBRR",                     # GBRR
+        "SupportedByDocumentId",    # guarantor document id
+        # --- Result field ---
+        "IgnorePledgeIndicator",    # DE0137 (expected result driver)
+    ]
 
 
 cfg = Config()
 
 
 # ==============================================================================
-# 2. BRR HIERARCHY (1 = best/lowest risk … 22 = worst)
+# 2. BRR HIERARCHY (1 best … 22 worst) + VECTORIZED rank mapping
 # ==============================================================================
 BRR_HIERARCHY = [
     "1+", "1H", "1M", "1L",
@@ -97,10 +120,10 @@ BRR_HIERARCHY = [
 _RANK = {r: i + 1 for i, r in enumerate(BRR_HIERARCHY)}
 
 
-def _normalize_rating(value):
-    if value is None:
+def _norm_scalar(s):
+    if s is None:
         return None
-    s = str(value).strip()
+    s = str(s).strip()
     if s == "" or s.lower() in {"nan", "null", "none", "blank"}:
         return None
     s = s.upper().replace(" ", "")
@@ -117,28 +140,21 @@ def _normalize_rating(value):
     return None
 
 
+def rank_series(series):
+    """Vectorized: map a rating Series -> Int rank (NaN if unmapped)."""
+    # normalize via a cached unique-value map (fast for large data)
+    uniques = series.dropna().unique()
+    lut = {u: _RANK.get(_norm_scalar(u)) for u in uniques}
+    return series.map(lut)
+
+
 def rating_rank(value):
-    n = _normalize_rating(value)
+    n = _norm_scalar(value)
     return _RANK.get(n) if n else None
 
 
-def relationship(brr_value, gbrr_value):
-    """better = lower rank (lower risk); worse = higher rank; equal = same."""
-    rb, rg = rating_rank(brr_value), rating_rank(gbrr_value)
-    if rb is None or rg is None:
-        return None
-    if rb < rg:
-        return "better"
-    if rb > rg:
-        return "worse"
-    return "equal"
-
-
 # ==============================================================================
-# 3. TEST CASE DEFINITIONS
-#    securedness: unsecured | partial | partial_multi | fully | any
-#    rel: better | equal | worse | None(any) | missing_brr | missing_gbrr
-#    guarantee: True | False | "partial" | None
+# 3. TEST CASES
 # ==============================================================================
 TEST_CASES = [
     ("CMS_Batch_01", "Unsecured Borrower - BRR better than GBRR",              "unsecured",     "better",       True,      "Y"),
@@ -159,17 +175,6 @@ TEST_CASES = [
     ("CMS_Batch_16", "GBRR is BLANK",                                          "any",           "missing_gbrr", True,      "Error"),
 ]
 
-
-# ==============================================================================
-# 4. HELPERS
-# ==============================================================================
-def _has_value(x):
-    if x is None:
-        return False
-    s = str(x).strip()
-    return s != "" and s.lower() not in {"nan", "null", "none", "blank"}
-
-
 AUDIT_COLS = [
     "_TestCaseNo", "_Scenario", "_SRF_Rank_In_Case",
     "_SRF_Source", "_MatchTriggeredThisRow",
@@ -178,78 +183,205 @@ AUDIT_COLS = [
 
 
 # ==============================================================================
-# 5. SRF-LEVEL STRUCTURE
+# 4. VECTORIZED "has value" for a whole Series
 # ==============================================================================
-def srf_collateral_count(group):
-    col = cfg.COL_COLLATERAL
-    if col not in group.columns:
-        return 0
-    return int(group[col].apply(_has_value).sum())
+def has_value_series(s):
+    if s is None:
+        return None
+    ss = s.astype(str).str.strip()
+    empty = ss.eq("") | ss.str.lower().isin(["nan", "null", "none", "blank"])
+    return ~empty
 
 
-def srf_has_guarantee(group):
-    gid, gtype = cfg.COL_GUARANTEE_ID, cfg.COL_GUAR_TYPE
-    has = False
-    if gid in group.columns:
-        has = has or group[gid].apply(_has_value).any()
-    if gtype in group.columns:
-        has = has or group[gtype].apply(_has_value).any()
-    return bool(has)
+# ==============================================================================
+# 5. PHASE 1 — read decision columns, classify every SRF (vectorized)
+# ==============================================================================
+def read_decision_frame(path, is_csv, sheet):
+    """Read only the decision columns. CSV uses chunked concat to cap memory."""
+    if is_csv:
+        chunks = []
+        reader = pd.read_csv(
+            path, dtype=str, usecols=lambda c: c in cfg.DECISION_COLS,
+            encoding=cfg.CSV_ENCODING, sep=cfg.CSV_SEP,
+            keep_default_na=False, chunksize=cfg.CSV_CHUNK,
+        )
+        for i, ch in enumerate(reader):
+            chunks.append(ch)
+            log.info(f"    scanned chunk {i+1} ({len(ch):,} rows)")
+        return pd.concat(chunks, ignore_index=True)
+    else:
+        # xlsx: can't chunk; read decision cols only
+        return pd.read_excel(path, sheet_name=sheet, dtype=str,
+                             usecols=lambda c: c in cfg.DECISION_COLS)
 
 
-def srf_matches_securedness(group, secured_req):
+def classify_srfs(dec):
+    """
+    Build a per-row helper frame + per-SRF classification, all vectorized.
+    Returns:
+      dec  : decision frame augmented with _rel, _has_coll, _has_guar, _brr_rank, _gbrr_rank
+      srf_info : DataFrame indexed by SRF with columns:
+                 coll_count, has_guar, secured_class
+    """
+    srf = cfg.COL_SRF
+
+    # vectorized ranks + relationship
+    dec["_brr_rank"] = rank_series(dec[cfg.COL_BRR])
+    dec["_gbrr_rank"] = rank_series(dec[cfg.COL_GBRR])
+
+    rb = dec["_brr_rank"]
+    rg = dec["_gbrr_rank"]
+    rel = np.where(rb.isna() | rg.isna(), None,
+          np.where(rb < rg, "better",
+          np.where(rb > rg, "worse", "equal")))
+    dec["_rel"] = rel
+
+    # per-row structural signals
+    dec["_has_coll"] = has_value_series(dec[cfg.COL_COLLATERAL]) if cfg.COL_COLLATERAL in dec else False
+    hg = pd.Series(False, index=dec.index)
+    if cfg.COL_GUARANTEE_ID in dec:
+        hg = hg | has_value_series(dec[cfg.COL_GUARANTEE_ID])
+    if cfg.COL_GUAR_TYPE in dec:
+        hg = hg | has_value_series(dec[cfg.COL_GUAR_TYPE])
+    dec["_has_guar_row"] = hg
+
+    # per-SRF aggregates (one C-level pass each)
+    g = dec.groupby(srf, sort=False)
+    coll_count = g["_has_coll"].sum().astype(int)
+    has_guar = g["_has_guar_row"].any()
+
+    srf_info = pd.DataFrame({"coll_count": coll_count, "has_guar": has_guar})
+
+    # securedness class from count
+    def _sec(n):
+        if n == 0:
+            return "unsecured"
+        if n == 1:
+            return "partial"      # single
+        return "multiple"         # >=2  (covers partial_multi & fully)
+    srf_info["secured_class"] = srf_info["coll_count"].map(_sec)
+
+    return dec, srf_info
+
+
+def secured_ok(secured_req, secured_class, coll_count):
     if secured_req == "any":
         return True
-    n = srf_collateral_count(group)
     if secured_req == "unsecured":
-        return n == 0
+        return secured_class == "unsecured"
     if secured_req == "partial":
-        return n == 1
+        return coll_count == 1
     if secured_req == "partial_multi":
-        return n >= 2
+        return coll_count >= 2
     if secured_req == "fully":
-        return n >= 1
+        return coll_count >= 1
     return False
 
 
-def srf_matches_guarantee(group, guar_req):
+def guar_ok(guar_req, has_guar):
     if guar_req is None:
         return True
-    has = srf_has_guarantee(group)
-    if guar_req is True:
-        return has
+    if guar_req is True or guar_req == "partial":
+        return bool(has_guar)
     if guar_req is False:
-        return not has
-    if guar_req == "partial":
-        return has          # presence proxy for partial guarantee
+        return not bool(has_guar)
     return True
 
 
-def find_matching_row_index(group, rel):
+# ==============================================================================
+# 6. CHOOSE SRFs PER CASE (works on the small per-SRF summary, not full data)
+# ==============================================================================
+def choose_srfs(dec, srf_info, ordered_srfs, case):
     """
-    Return the index label of the FIRST row in the SRF whose BorrowerBRR-vs-GBRR
-    relationship equals `rel`. If rel is None/'mixed', return the first row.
-    Returns None if no row matches.
+    Return a list of tuples: (srf, source_label, trigger_relationship)
+    describing up to SRF_PER_CASE chosen SRFs for this case.
+    Uses vectorized per-SRF relationship availability.
     """
-    if rel in (None, "mixed"):
-        return group.index[0]
-    for idx, row in group.iterrows():
-        if relationship(row.get(cfg.COL_BRR), row.get(cfg.COL_GBRR)) == rel:
-            return idx
-    return None
+    no, scenario, secured_req, rel, guar_req, expected = case
+
+    # Precompute, per SRF, which relationships are available among its rows.
+    # Build once per case call is wasteful; caller passes a shared structure.
+    rel_by_srf = case_rel_lookup  # module-level cache set in main()
+
+    chosen = []
+    used = set()
+
+    # Missing-value cases: any structurally/guarantee-eligible SRF works
+    if rel in ("missing_brr", "missing_gbrr"):
+        for srf in ordered_srfs:
+            if len(chosen) >= cfg.SRF_PER_CASE:
+                break
+            info = srf_info.loc[srf]
+            if guar_ok(guar_req, info["has_guar"]):
+                chosen.append((srf, "MISSING", None))
+        return chosen
+
+    # PASS 1 — natural
+    for srf in ordered_srfs:
+        if len(chosen) >= cfg.SRF_PER_CASE:
+            break
+        info = srf_info.loc[srf]
+        if not secured_ok(secured_req, info["secured_class"], info["coll_count"]):
+            continue
+        if not guar_ok(guar_req, info["has_guar"]):
+            continue
+        if rel in (None, "mixed"):
+            chosen.append((srf, "NATURAL", None)); used.add(srf); continue
+        if rel in rel_by_srf.get(srf, ()):
+            chosen.append((srf, "NATURAL", rel)); used.add(srf)
+
+    # PASS 2 — borrow (structure ok, relationship forced on one row)
+    if len(chosen) < cfg.SRF_PER_CASE and rel not in (None, "mixed"):
+        for srf in ordered_srfs:
+            if len(chosen) >= cfg.SRF_PER_CASE:
+                break
+            if srf in used:
+                continue
+            info = srf_info.loc[srf]
+            if not secured_ok(secured_req, info["secured_class"], info["coll_count"]):
+                continue
+            if not guar_ok(guar_req, info["has_guar"]):
+                continue
+            chosen.append((srf, "BORROW", rel)); used.add(srf)
+
+    # PASS 3 — force
+    if len(chosen) < cfg.SRF_PER_CASE and rel not in (None, "mixed"):
+        for srf in ordered_srfs:
+            if len(chosen) >= cfg.SRF_PER_CASE:
+                break
+            if srf in used:
+                continue
+            info = srf_info.loc[srf]
+            if not secured_ok(secured_req, info["secured_class"], info["coll_count"]):
+                continue
+            if not guar_ok(guar_req, info["has_guar"]):
+                continue
+            chosen.append((srf, "FORCE", rel)); used.add(srf)
+
+    # rel None/mixed fallback already handled in PASS1
+    return chosen
 
 
 # ==============================================================================
-# 6. RELATIONSHIP FORCING / BORROWING
+# 7. PHASE 2 — pull FULL rows for chosen SRFs only, then apply edits
 # ==============================================================================
-def force_ratings_for_relationship(rel):
-    if rel == "better":
-        return "2H", "3H"
-    if rel == "worse":
-        return "3H", "2H"
-    if rel == "equal":
-        return "2H", "2H"
-    return None, None
+def read_full_rows_for(path, is_csv, sheet, wanted_srfs):
+    """Read all columns but keep only rows whose SRF is in wanted_srfs."""
+    srf = cfg.COL_SRF
+    wanted = set(str(x) for x in wanted_srfs)
+    if is_csv:
+        out = []
+        reader = pd.read_csv(path, dtype=str, encoding=cfg.CSV_ENCODING,
+                             sep=cfg.CSV_SEP, keep_default_na=False,
+                             chunksize=cfg.CSV_CHUNK)
+        for ch in reader:
+            keep = ch[ch[srf].astype(str).isin(wanted)]
+            if not keep.empty:
+                out.append(keep)
+        return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+    else:
+        full = pd.read_excel(path, sheet_name=sheet, dtype=str)
+        return full[full[srf].astype(str).isin(wanted)].copy()
 
 
 def donor_gbrr_for(rel, brr_value):
@@ -271,297 +403,202 @@ def donor_gbrr_for(rel, brr_value):
     return BRR_HIERARCHY[want - 1]
 
 
-# ==============================================================================
-# 7. BUILD OUTPUT ROWS FOR A CHOSEN SRF
-# ==============================================================================
-def emit_srf(group, case, srf_rank, source, trigger_idx):
-    """Return a DataFrame: all rows of this SRF + audit columns."""
+def force_ratings(rel):
+    return {"better": ("2H", "3H"), "worse": ("3H", "2H"),
+            "equal": ("2H", "2H")}.get(rel, (None, None))
+
+
+def build_case_sheet(full_map, case, chosen, original_cols):
+    """Assemble the output rows (all cols + audit) for one test case."""
     no, scenario, secured_req, rel, guar_req, expected = case
-    out = group.copy()
-    out["_TestCaseNo"] = no
-    out["_Scenario"] = scenario
-    out["_SRF_Rank_In_Case"] = srf_rank
-    out["_SRF_Source"] = source
-    out["_MatchTriggeredThisRow"] = [
-        "YES" if idx == trigger_idx else "" for idx in out.index
-    ]
-    out["_Orig_BorrowerBRR"] = out.get(cfg.COL_BRR)
-    out["_Orig_GBRR"] = out.get(cfg.COL_GBRR)
-    out["_ExpectedIgnorePledge"] = expected
-    return out
+    frames = []
 
-
-def apply_missing(group, case):
-    """Handle CMS_Batch_14/15/16 — null/blank a rating on all rows of the SRF."""
-    no, scenario, secured_req, rel, guar_req, expected = case
-    out = group.copy()
-    out["_Orig_BorrowerBRR"] = out.get(cfg.COL_BRR)
-    out["_Orig_GBRR"] = out.get(cfg.COL_GBRR)
-    if rel == "missing_brr":
-        out[cfg.COL_BRR] = np.nan
-        src = "FORCED(BRR->NULL)"
-    else:
-        out[cfg.COL_GBRR] = "" if no == "CMS_Batch_16" else np.nan
-        src = "FORCED(GBRR->NULL/BLANK)" if no == "CMS_Batch_15" else "FORCED(GBRR->BLANK)"
-    out["_TestCaseNo"] = no
-    out["_Scenario"] = scenario
-    out["_SRF_Source"] = src
-    out["_MatchTriggeredThisRow"] = ""
-    out["_ExpectedIgnorePledge"] = expected
-    return out, src
-
-
-def apply_borrow(group, case, trigger_idx):
-    """Option A: swap GBRR on the matching row to force the relationship."""
-    no, scenario, secured_req, rel, guar_req, expected = case
-    out = group.copy()
-    out["_Orig_BorrowerBRR"] = out.get(cfg.COL_BRR)
-    out["_Orig_GBRR"] = out.get(cfg.COL_GBRR)
-
-    brr = out.at[trigger_idx, cfg.COL_BRR]
-    new_gbrr = donor_gbrr_for(rel, brr)
-    if new_gbrr is None:
-        return None, None
-    orig = out.at[trigger_idx, cfg.COL_GBRR]
-    out.at[trigger_idx, cfg.COL_GBRR] = new_gbrr
-
-    out["_TestCaseNo"] = no
-    out["_Scenario"] = scenario
-    src = f"BORROWED(row GBRR {orig}->{new_gbrr})"
-    out["_SRF_Source"] = src
-    out["_MatchTriggeredThisRow"] = [
-        "YES" if idx == trigger_idx else "" for idx in out.index
-    ]
-    out["_ExpectedIgnorePledge"] = expected
-    return out, src
-
-
-def apply_force(group, case):
-    """Force clean BRR/GBRR on the first row of the SRF."""
-    no, scenario, secured_req, rel, guar_req, expected = case
-    out = group.copy()
-    out["_Orig_BorrowerBRR"] = out.get(cfg.COL_BRR)
-    out["_Orig_GBRR"] = out.get(cfg.COL_GBRR)
-    fb, fg = force_ratings_for_relationship(rel)
-    if fb is None:
-        return None, None
-    tgt = out.index[0]
-    out.at[tgt, cfg.COL_BRR] = fb
-    out.at[tgt, cfg.COL_GBRR] = fg
-    out["_TestCaseNo"] = no
-    out["_Scenario"] = scenario
-    src = f"FORCED(BRR={fb},GBRR={fg})"
-    out["_SRF_Source"] = src
-    out["_MatchTriggeredThisRow"] = ["YES" if i == tgt else "" for i in out.index]
-    out["_ExpectedIgnorePledge"] = expected
-    return out, src
-
-
-# ==============================================================================
-# 8. PER-TEST-CASE SELECTION (SRF-group based)
-# ==============================================================================
-def select_for_case(srf_groups, ordered_srfs, case):
-    no, scenario, secured_req, rel, guar_req, expected = case
-    log.info(f"--- {no}: {scenario}")
-
-    chosen = []          # list of output DataFrames
-    natural_taken = 0
-
-    # ---- Missing-value cases: pick structurally-eligible SRFs, then null/blank
-    if rel in ("missing_brr", "missing_gbrr"):
-        for srf in ordered_srfs:
-            if len(chosen) >= cfg.SRF_PER_CASE:
-                break
-            g = srf_groups[srf]
-            if srf_matches_guarantee(g, guar_req):   # securedness = 'any' here
-                out, _ = apply_missing(g, case)
-                out["_SRF_Rank_In_Case"] = len(chosen) + 1
-                chosen.append(out)
-        log.info(f"    emitted {len(chosen)} SRF(s)")
-        return _finalize(chosen)
-
-    # ---- PASS 1: natural SRFs (structure ok + a row already has the relationship)
-    used = set()
-    for srf in ordered_srfs:
-        if len(chosen) >= cfg.SRF_PER_CASE:
-            break
-        g = srf_groups[srf]
-        if not srf_matches_securedness(g, secured_req):
+    for rank_i, (srf, source, trig_rel) in enumerate(chosen, start=1):
+        grp = full_map.get(str(srf))
+        if grp is None or grp.empty:
             continue
-        if not srf_matches_guarantee(g, guar_req):
-            continue
-        trig = find_matching_row_index(g, rel)
-        if trig is None:
-            continue
-        out = emit_srf(g, case, len(chosen) + 1, "NATURAL", trig)
-        chosen.append(out)
-        used.add(srf)
-        natural_taken += 1
-    log.info(f"    PASS1 natural SRFs: {natural_taken}")
+        out = grp.copy()
+        out["_Orig_BorrowerBRR"] = out.get(cfg.COL_BRR)
+        out["_Orig_GBRR"] = out.get(cfg.COL_GBRR)
+        out["_TestCaseNo"] = no
+        out["_Scenario"] = scenario
+        out["_SRF_Rank_In_Case"] = rank_i
+        out["_ExpectedIgnorePledge"] = expected
+        out["_MatchTriggeredThisRow"] = ""
 
-    # ---- PASS 2: borrow (structure ok, force relationship on a matching row)
-    if len(chosen) < cfg.SRF_PER_CASE and rel not in (None, "mixed"):
-        for srf in ordered_srfs:
-            if len(chosen) >= cfg.SRF_PER_CASE:
-                break
-            if srf in used:
-                continue
-            g = srf_groups[srf]
-            if not srf_matches_securedness(g, secured_req):
-                continue
-            if not srf_matches_guarantee(g, guar_req):
-                continue
-            # pick any row to adjust (first row of the SRF)
-            trig = g.index[0]
-            out, src = apply_borrow(g, case, trig)
-            if out is None:
-                continue
-            out["_SRF_Rank_In_Case"] = len(chosen) + 1
-            chosen.append(out)
-            used.add(srf)
-        log.info(f"    after PASS2 borrow: {len(chosen)}")
+        if source == "MISSING":
+            if rel == "missing_brr":
+                out[cfg.COL_BRR] = np.nan
+                out["_SRF_Source"] = "FORCED(BRR->NULL)"
+            else:
+                out[cfg.COL_GBRR] = "" if no == "CMS_Batch_16" else np.nan
+                out["_SRF_Source"] = ("FORCED(GBRR->BLANK)" if no == "CMS_Batch_16"
+                                      else "FORCED(GBRR->NULL)")
 
-    # ---- PASS 3: force clean values on a structurally-eligible SRF
-    if len(chosen) < cfg.SRF_PER_CASE and rel not in (None, "mixed"):
-        for srf in ordered_srfs:
-            if len(chosen) >= cfg.SRF_PER_CASE:
-                break
-            if srf in used:
-                continue
-            g = srf_groups[srf]
-            if not srf_matches_securedness(g, secured_req):
-                continue
-            if not srf_matches_guarantee(g, guar_req):
-                continue
-            out, src = apply_force(g, case)
-            if out is None:
-                continue
-            out["_SRF_Rank_In_Case"] = len(chosen) + 1
-            chosen.append(out)
-            used.add(srf)
-        log.info(f"    after PASS3 force: {len(chosen)}")
+        elif source == "NATURAL":
+            out["_SRF_Source"] = "NATURAL"
+            if trig_rel not in (None, "mixed"):
+                # mark first row that already satisfies the relationship
+                rb = rank_series(out[cfg.COL_BRR])
+                rg = rank_series(out[cfg.COL_GBRR])
+                if trig_rel == "better":
+                    mask = rb < rg
+                elif trig_rel == "worse":
+                    mask = rb > rg
+                else:
+                    mask = rb == rg
+                idxs = out.index[mask.fillna(False)]
+                if len(idxs):
+                    out.loc[idxs[0], "_MatchTriggeredThisRow"] = "YES"
 
-    # ---- rel is None / 'mixed': just take structurally-eligible SRFs
-    if rel in (None, "mixed") and len(chosen) < cfg.SRF_PER_CASE:
-        for srf in ordered_srfs:
-            if len(chosen) >= cfg.SRF_PER_CASE:
-                break
-            if srf in used:
-                continue
-            g = srf_groups[srf]
-            if not srf_matches_securedness(g, secured_req):
-                continue
-            if not srf_matches_guarantee(g, guar_req):
-                continue
-            trig = g.index[0]
-            out = emit_srf(g, case, len(chosen) + 1, "NATURAL", trig)
-            chosen.append(out)
-            used.add(srf)
+        elif source == "BORROW":
+            tgt = out.index[0]
+            brr = out.at[tgt, cfg.COL_BRR]
+            new_g = donor_gbrr_for(rel, brr)
+            if new_g is None:
+                # fall back to force if borrow impossible for this BRR
+                fb, fg = force_ratings(rel)
+                out.at[tgt, cfg.COL_BRR] = fb
+                out.at[tgt, cfg.COL_GBRR] = fg
+                out["_SRF_Source"] = f"FORCED(BRR={fb},GBRR={fg})"
+            else:
+                orig = out.at[tgt, cfg.COL_GBRR]
+                out.at[tgt, cfg.COL_GBRR] = new_g
+                out["_SRF_Source"] = f"BORROWED(row GBRR {orig}->{new_g})"
+            out.at[tgt, "_MatchTriggeredThisRow"] = "YES"
 
-    if len(chosen) < cfg.SRF_PER_CASE:
-        log.warning(f"    ONLY {len(chosen)} SRF(s) qualified for {no} "
-                    f"(wanted {cfg.SRF_PER_CASE})")
+        elif source == "FORCE":
+            tgt = out.index[0]
+            fb, fg = force_ratings(rel)
+            out.at[tgt, cfg.COL_BRR] = fb
+            out.at[tgt, cfg.COL_GBRR] = fg
+            out["_SRF_Source"] = f"FORCED(BRR={fb},GBRR={fg})"
+            out.at[tgt, "_MatchTriggeredThisRow"] = "YES"
 
-    return _finalize(chosen)
+        frames.append(out)
 
-
-def _finalize(chosen):
-    if not chosen:
-        return pd.DataFrame()
-    return pd.concat(chosen, ignore_index=True)
+    if not frames:
+        return pd.DataFrame(columns=original_cols + AUDIT_COLS)
+    res = pd.concat(frames, ignore_index=True)
+    return res.reindex(columns=original_cols + AUDIT_COLS)
 
 
 # ==============================================================================
-# 9. MAIN
+# 8. MAIN
 # ==============================================================================
+case_rel_lookup = {}   # module-level cache: srf -> set of available relationships
+
+
 def main():
-    ap = argparse.ArgumentParser(description="LGD SRF-group test data generator")
+    ap = argparse.ArgumentParser(description="LGD fast SRF test data generator")
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", default="testcase_testdata.xlsx")
     ap.add_argument("--srf-per-case", type=int, default=cfg.SRF_PER_CASE)
-    ap.add_argument("--sheet", default=None)
     ap.add_argument("--order", choices=["asc", "desc"], default="asc")
+    ap.add_argument("--sheet", default=None)
+    ap.add_argument("--csv-sep", default=None)
+    ap.add_argument("--csv-encoding", default=None)
     args = ap.parse_args()
 
     cfg.SRF_PER_CASE = args.srf_per_case
+    if args.csv_sep:
+        cfg.CSV_SEP = args.csv_sep
+    if args.csv_encoding:
+        cfg.CSV_ENCODING = args.csv_encoding
     sheet = args.sheet if args.sheet is not None else cfg.INPUT_SHEET
+    is_csv = args.input.lower().endswith(".csv")
 
-    log.info(f"Reading {args.input} (sheet={sheet}) ...")
-    try:
-        df = pd.read_excel(args.input, sheet_name=sheet, dtype=str)
-    except Exception as e:
-        sys.exit(f"[FATAL] could not read input: {e}")
-    log.info(f"Loaded {len(df):,} rows x {len(df.columns)} cols")
+    log.info(f"Input: {args.input} ({'CSV' if is_csv else 'Excel'})")
 
-    if cfg.COL_SRF not in df.columns:
-        sys.exit(f"[FATAL] grouping column '{cfg.COL_SRF}' not found. "
-                 f"Columns start with: {list(df.columns)[:8]}")
+    # ---- PHASE 1: decision scan ----
+    log.info("PHASE 1: scanning decision columns ...")
+    dec = read_decision_frame(args.input, is_csv, sheet)
+    log.info(f"  decision frame: {len(dec):,} rows x {len(dec.columns)} cols")
 
-    for c in (cfg.COL_BRR, cfg.COL_GBRR):
-        if c not in df.columns:
-            log.warning(f"Column '{c}' not found — check Config header names.")
+    if cfg.COL_SRF not in dec.columns:
+        sys.exit(f"[FATAL] '{cfg.COL_SRF}' not found. Check header names in Config.")
 
-    _report_unmapped_ratings(df)
+    dec, srf_info = classify_srfs(dec)
+    log.info(f"  classified {len(srf_info):,} SRF groups")
 
-    # group by SRF, preserve original columns/order
-    original_cols = list(df.columns)
-    srf_groups = {srf: g for srf, g in df.groupby(cfg.COL_SRF, sort=False)}
+    # per-SRF set of available relationships (vectorized groupby)
+    global case_rel_lookup
+    rel_nonnull = dec[dec["_rel"].notna()]
+    case_rel_lookup = (
+        rel_nonnull.groupby(cfg.COL_SRF)["_rel"].agg(lambda s: set(s)).to_dict()
+    )
 
-    # order the SRF keys ascending/descending (numeric-aware)
+    # order SRFs numeric-aware
     def _key(v):
         try:
             return (0, float(str(v)))
         except (ValueError, TypeError):
             return (1, str(v))
-    ordered_srfs = sorted(srf_groups.keys(), key=_key,
+    ordered_srfs = sorted(srf_info.index.tolist(), key=_key,
                           reverse=(args.order == "desc"))
-    log.info(f"Total SRF groups: {len(ordered_srfs):,} (order={args.order})")
 
+    # ---- choose SRFs for every case (tiny work on the summary) ----
+    plan = {}
+    wanted_all = set()
+    for case in TEST_CASES:
+        chosen = choose_srfs(dec, srf_info, ordered_srfs, case)
+        plan[case[0]] = (case, chosen)
+        for srf, _, _ in chosen:
+            wanted_all.add(str(srf))
+        if len(chosen) < cfg.SRF_PER_CASE:
+            log.warning(f"  {case[0]}: only {len(chosen)} SRF(s) qualified")
+        else:
+            log.info(f"  {case[0]}: chose {len(chosen)} SRF(s)")
+
+    log.info(f"Total distinct SRFs to pull: {len(wanted_all)}")
+
+    # free decision frame memory before the wide read
+    del dec
+    import gc; gc.collect()
+
+    # ---- PHASE 2: pull full-width rows for chosen SRFs only ----
+    log.info("PHASE 2: reading full rows for chosen SRFs ...")
+    full = read_full_rows_for(args.input, is_csv, sheet, wanted_all)
+    if full.empty:
+        sys.exit("[FATAL] no rows pulled in phase 2 — check SRF matching.")
+    # --- decide which original columns to KEEP in the output ---
+    if cfg.OUTPUT_COLS is None:
+        original_cols = list(full.columns)
+    else:
+        present = [c for c in cfg.OUTPUT_COLS if c in full.columns]
+        missing = [c for c in cfg.OUTPUT_COLS if c not in full.columns]
+        if missing:
+            log.warning(f"  OUTPUT_COLS not found in file (skipped): {missing}")
+        # always ensure the SRF key and rating cols are present for internal use
+        for must in (cfg.COL_SRF, cfg.COL_BRR, cfg.COL_GBRR):
+            if must not in present and must in full.columns:
+                present.append(must)
+        original_cols = present
+        log.info(f"  keeping {len(original_cols)} output columns")
+
+    full_map = {str(srf): g for srf, g in full.groupby(cfg.COL_SRF, sort=False)}
+    log.info(f"  pulled {len(full):,} rows across {len(full_map)} SRFs")
+
+    # ---- write output ----
     with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
         summary = []
         for case in TEST_CASES:
-            out = select_for_case(srf_groups, ordered_srfs, case)
-            if out.empty:
-                # still write an empty sheet with headers
-                out = pd.DataFrame(columns=original_cols + AUDIT_COLS)
-            ordered_cols = original_cols + [c for c in AUDIT_COLS if c in out.columns]
-            # ensure all audit cols exist
-            for c in AUDIT_COLS:
-                if c not in out.columns:
-                    out[c] = ""
-            out = out.reindex(columns=original_cols + AUDIT_COLS)
-            out.to_excel(writer, sheet_name=case[0][:31], index=False)
-
-            n_srf = out["_TestCaseNo"].notna().sum() and out.get("_SRF_Rank_In_Case")
-            distinct_srf = (
-                out[cfg.COL_SRF].nunique() if cfg.COL_SRF in out.columns and not out.empty else 0
-            )
+            c, chosen = plan[case[0]]
+            sheet_df = build_case_sheet(full_map, c, chosen, original_cols)
+            sheet_df.to_excel(writer, sheet_name=case[0][:31], index=False)
+            distinct = sheet_df[cfg.COL_SRF].nunique() if not sheet_df.empty else 0
+            srcs = ", ".join(sorted(set(
+                str(s) for s in sheet_df.get("_SRF_Source", pd.Series(dtype=str)).dropna().unique()
+            ))) if not sheet_df.empty else ""
             summary.append({
-                "TestCaseNo": case[0],
-                "Scenario": case[1],
-                "SRFs_Emitted": distinct_srf,
-                "Total_Rows": len(out),
-                "Sources": ", ".join(sorted(set(
-                    str(s) for s in out.get("_SRF_Source", pd.Series(dtype=str)).dropna().unique()
-                ))) if not out.empty else "",
-                "ExpectedIgnorePledge": case[5],
+                "TestCaseNo": case[0], "Scenario": case[1],
+                "SRFs_Emitted": distinct, "Total_Rows": len(sheet_df),
+                "Sources": srcs, "ExpectedIgnorePledge": case[5],
             })
         pd.DataFrame(summary).to_excel(writer, sheet_name="_SUMMARY", index=False)
 
     log.info(f"Wrote {args.output}")
     print(f"\nDone. Output: {args.output}")
-
-
-def _report_unmapped_ratings(df):
-    bad = set()
-    for col in (cfg.COL_BRR, cfg.COL_GBRR):
-        if col in df.columns:
-            for v in df[col].dropna().unique():
-                if _has_value(v) and rating_rank(v) is None:
-                    bad.add(str(v))
-    if bad:
-        log.warning(f"Unmapped rating values: "
-                    f"{sorted(bad)[:20]}{' ...' if len(bad) > 20 else ''}")
 
 
 if __name__ == "__main__":
